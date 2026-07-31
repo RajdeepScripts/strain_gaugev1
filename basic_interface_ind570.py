@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 basic_interface_ind570.py — 4x4 Basic Interface (IND570 over TCP)
-Replicates the Russian 4-channel layout exactly. Data from Mettler-Toledo IND570.
+4-channel weight display. Data from Mettler-Toledo IND570.
 """
 
 import re
