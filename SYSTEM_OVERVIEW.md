@@ -3,7 +3,7 @@
 **ADJ Engineering Pvt. Ltd.**
 Covers the current production path only: `basic_interface_ind570.py` (PyQt5 GUI) reading from a **Mettler-Toledo IND570** weighing terminal wired to a **Mettler-Toledo load cell** (not a raw strain-gauge bridge).
 
-> The older USB-packet / Wheatstone-arm architecture described in `DOCUMENTATION.md` (`bridge.c`, `basic_interface.c`, `gui_interface.py`, 45-byte binary packets) is retained there as historical reference. It is **not** part of the current system and is not covered here.
+> An older USB-packet / Wheatstone-arm architecture (`bridge.c`, `basic_interface.c`, `gui_interface.py`, 45-byte binary packets) previously existed in this repo and has since been removed. `basic_interface_ind570.py` is the sole application going forward.
 
 ---
 

@@ -503,24 +503,23 @@ class MainWindow(QMainWindow):
         for ch in self._channels:
             ch._unit_label.setText(unit)
 
+    def _apply_mode(self, kg: float, mode: str):
+        if mode == "kg":
+            return kg, "kg"
+        elif mode == "2 × kg":
+            return kg * 2, "kg"
+        elif mode == "Tons":
+            return kg, "T"
+        else:
+            return kg * 2, "T"
+
     def _on_delta(self):
         d = self._state.snapshot()
         if d['valid'] != 1:
             return
         kg   = d['result_kg']
         mode = self._mode_combo.currentText()
-        if mode == "kg":
-            val  = kg
-            unit = "kg"
-        elif mode == "2 × kg":
-            val  = kg * 2
-            unit = "kg"
-        elif mode == "Tons":
-            val  = kg
-            unit = "T"
-        else:
-            val  = kg * 2
-            unit = "T"
+        val, unit = self._apply_mode(kg, mode)
         for ch in self._channels:
             ch.set_delta(val, kg)
         self._base_label.setText(f"Base: {val:.3f} {unit}")
@@ -556,18 +555,7 @@ class MainWindow(QMainWindow):
             )
             kg   = d['result_kg']
             mode = self._mode_combo.currentText()
-            if mode == "kg":
-                val  = kg
-                unit = "kg"
-            elif mode == "2 × kg":
-                val  = kg * 2
-                unit = "kg"
-            elif mode == "Tons":
-                val  = kg
-                unit = "T"
-            else:   # 2 × Tons
-                val  = kg * 2
-                unit = "T"
+            val, unit = self._apply_mode(kg, mode)
             for ch in self._channels:
                 ch.update_value(val, unit, kg)
 

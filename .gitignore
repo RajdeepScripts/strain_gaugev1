@@ -3,10 +3,3 @@ build/
 __pycache__/
 *.exe
 *.pyc
-
-reader
-bridge
-gui
-replay
-check_packet
-basic_interface
