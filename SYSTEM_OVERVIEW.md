@@ -1,65 +1,51 @@
-# WIM Terminal — System Overview (Current System)
+# WIM Terminal — System Overview
 
-**ADJ Engineering Pvt. Ltd.**
-Covers the current production path only: `basic_interface_ind570.py` (PyQt5 GUI) reading from a **Mettler-Toledo IND570** weighing terminal wired to a **Mettler-Toledo load cell** (not a raw strain-gauge bridge).
+Covers `basic_interface_ind570.py` — PyQt5 GUI, reads from a Mettler-Toledo IND570 weighing terminal wired to a Mettler-Toledo load cell.
 
-> An older USB-packet / Wheatstone-arm architecture (`bridge.c`, `basic_interface.c`, `gui_interface.py`, 45-byte binary packets) previously existed in this repo and has since been removed. `basic_interface_ind570.py` is the sole application going forward.
+(Old USB-packet / Wheatstone-arm stuff — bridge.c, basic_interface.c, gui_interface.py — is gone. This is the only app now.)
 
 ---
 
-## 1. What the system is
-
-A live weight-display application for a weighbridge/WIM (Weigh-In-Motion) setup:
+## What it does
 
 ```
 Mettler-Toledo load cell
-        │  (analog load signal)
+        │  analog signal
         ▼
-   IND570 terminal            ← does ADC, scaling, and outputs a weight stream
-        │  Ethernet (TCP), plain ASCII text
+   IND570 terminal        ← ADC + scaling, outputs weight over TCP
+        │  Ethernet, ASCII text
         ▼
-basic_interface_ind570.py     ← this application (PyQt5 GUI)
+basic_interface_ind570.py
         │
         ▼
-   On-screen 4-channel display (7-segment style)
+   4-column on-screen display (7-segment style)
 ```
 
-The IND570 is the only thing that talks to the load cell directly. The application never touches the sensor signal — it only reads a text stream the IND570 already produces over the network. See `ETHERNET_DATA_TRANSMISSION.md` for the full detail on that link.
+IND570 talks to the load cell. The app just reads a text stream off the network — see `ETHERNET_DATA_TRANSMISSION.md` for that part.
 
 ---
 
-## 2. Why a "4-channel" layout, with one physical load cell
+## Why 4 channels for 1 load cell
 
-The UI (`ChannelColumn`, "4x4 Basic Interface") renders **four identical channel columns**, but the current hardware is a single IND570 + single Mettler-Toledo load cell feed. All four columns read the same underlying value from `SharedState` — the 4-channel layout is inherited from an earlier 4-load-cell platform design and kept for UI consistency. There is currently no per-channel hardware wiring; it is one live value replicated across four display columns.
-
----
-
-## 3. Application architecture
-
-### 3.1 Process / threading model
-
-| Component | Type | Responsibility |
-|---|---|---|
-| `reader_thread()` | Background `threading.Thread` (daemon) | Owns the TCP socket to the IND570; parses incoming lines; pushes values into `SharedState` |
-| `SharedState` | Thread-safe object (`threading.Lock`) | Holds the latest averaged result, validity flag, byte counter; read/written from both the reader thread and the UI thread |
-| `MainWindow` (Qt `QMainWindow`) | Main/UI thread | Builds the window, drives a `QTimer` at 100 ms to poll `SharedState` and redraw |
-
-The reader thread and the UI thread never touch each other's data directly — everything passes through `SharedState`'s locked `push()` / `snapshot()` methods. This is the standard pattern for keeping a Qt UI responsive while a blocking socket read happens elsewhere.
-
-### 3.2 Startup sequence
-
-1. `main()` creates the `QApplication`, sets the `Fusion` style, and constructs `MainWindow`.
-2. `MainWindow.__init__` builds all UI panels, creates a `SharedState(avg_win=100)`, sets a `threading.Event` (`_running`) to signaled, and starts `reader_thread` as a daemon thread.
-3. A `QTimer` fires every 100 ms calling `_update_ui()`, which is the only place the UI actually reflects new data.
-4. The reader thread independently loops: connect → read → parse → push, retrying every 2 seconds on failure, for as long as `_running` stays set.
-
-### 3.3 Shutdown
-
-`MainWindow.closeEvent` clears the `_running` event, which lets the reader thread's loop exit on its next check; the thread is a daemon so it won't block process exit even if it's mid-`recv()`.
+UI shows 4 identical columns (`ChannelColumn`), but there's one IND570 feed. All 4 read the same value from `SharedState`. Leftover from an older 4-load-cell layout — kept for consistency, not because there's 4 sensors.
 
 ---
 
-## 4. UI layout
+## Threading
+
+- `reader_thread()` — daemon thread, owns the TCP socket, parses lines, pushes into `SharedState`
+- `SharedState` — lock-protected, holds latest average + validity flag + byte count
+- `MainWindow` — UI thread, `QTimer` polls `SharedState` every 100ms and redraws
+
+Reader thread and UI thread never touch each other directly, only through `SharedState.push()` / `.snapshot()`.
+
+Startup: `main()` → `QApplication` → `MainWindow.__init__` builds UI, starts reader thread, starts the 100ms timer. Reader loop: connect → read → parse → push, retry every 2s on failure.
+
+Shutdown: `closeEvent` clears the running flag, reader thread exits on next check (daemon, so it won't block exit either way).
+
+---
+
+## UI layout
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -80,102 +66,74 @@ The reader thread and the UI thread never touch each other's data directly — e
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 Top bar — "COM-Port controls"
+**COM-Port controls (top bar)** — Start/Stop actually work (toggle the reader thread). The port dropdown (`COM7`, `192.168.0.1:1702`), "Update port list", and "Save port name" don't do anything — connection target is hardcoded (`IND570_HOST`/`IND570_PORT` in the source). Same for "Save coefficients."
 
-A `QGroupBox` with **Start / Stop** buttons, a port dropdown pre-populated with `COM7` and `192.168.0.1:1702`, and **Update port list** / **Save port name** buttons.
+**Each channel column:**
+- Title, "Chanel N"
+- Top 7-seg display — static "0", not live
+- `temp =` — always "0", no temp input exists
+- Two `k =` fields — default `0.0067563`, not used in any calc
+- Value display + unit — this one's real, updates every 100ms
+- Calibration value + Calibrate — adds an offset to that column only
+- Zero / Cancel zero — blanks that column only, doesn't touch the global average
 
-**Important:** this entire group is cosmetic/legacy. None of these controls read or change the actual connection target — the app always connects to the hardcoded `IND570_HOST:IND570_PORT` (`basic_interface_ind570.py:22-23`). Start/Stop do work (they toggle the reader thread via `_running`), but the COM port dropdown and its buttons are not wired to anything.
-
-### 4.2 Channel columns (×4)
-
-Each `ChannelColumn`:
-- **Title** — "Chanel N"
-- **Top 7-segment display** — currently always shows a static `"0"` (or blank when zeroed); not driven by live data in the current build
-- **temp =** — read-only field, always `"0"` (no temperature input exists in this system)
-- **Two "k =" fields** — free-text coefficient inputs, default `0.0067563`; present in the UI but not read by any calculation in the current code
-- **Value display (7-segment) + unit label** — this is the live figure: shows the averaged/converted weight, updated every 100 ms
-- **Calibration value** field + **Calibrate** button — sets a per-column additive offset (`_cal_offset`) applied to that column's displayed value only
-- **Zero** / **Cancel zero** buttons — per-column blanking (shows `" 0"` on both displays), independent of the other three columns and independent of the global tare
-
-### 4.3 Bottom bar
-
-- **Average by N measurements** (`QSpinBox`, 1–1000) — live-adjusts the rolling-average window size in `SharedState`
-- **Mode** dropdown — `kg`, `2 × kg`, `Tons`, `2 × Tons`; scales the live kg value and changes the unit label (see §5)
-- **Δ Delta** — captures current value as a base for all four columns (see §5.1)
-- **Live** — clears the delta base, returns to live display
-- **Base: …** label — shows the currently captured delta base, blank when not set
-- **Last packages / Bytes on port** — status line; shows a red error message if the TCP connection is down
-- **Exit program** — closes the window
+**Bottom bar** — average window (1–1000), mode dropdown, Delta/Live, base label, status line, exit.
 
 ---
 
-## 5. Modes and calculations
+## Modes
 
-| Mode | Displayed value | Unit shown |
+| Mode | Value shown | Unit |
 |---|---|---|
-| `kg` | live averaged kg | `kg` |
-| `2 × kg` | live averaged kg × 2 | `kg` |
-| `Tons` | live averaged kg (no conversion factor applied) | `T` |
-| `2 × Tons` | live averaged kg × 2 | `T` |
+| kg | avg kg | kg |
+| 2 × kg | avg kg × 2 | kg |
+| Tons | avg kg (no ÷1000) | T |
+| 2 × Tons | avg kg × 2 (no ÷1000) | T |
 
-> Note: "Tons" mode currently displays the same numeric value as `kg` mode, just with the unit label changed to `T` — there is no ÷1000 conversion applied in `_update_ui` or `_on_mode_changed`. If a true kg→ton conversion is required, this is a code change, not a configuration option.
+Tons mode doesn't actually convert — same number as kg, just relabeled. Fix requires a code change if real ton conversion is wanted.
 
-### 5.1 Delta (Δ) feature
+**Delta** — press Δ to grab current value as a base. Display then shows `base + (current_raw_kg − base_raw_kg) / 1000`, so small changes show up as decimals on a big base. Press Live to clear it.
 
-- Pressing **Δ Delta** captures the current mode-adjusted value and the current raw kg (`_on_delta`), storing both as the "base" for every channel column.
-- While a base is set, each column's value display shows:
-  `base + (current_raw_kg − base_raw_kg) / 1000`
-  i.e., the base plus a small decimal representing the change since the base was captured — useful for watching small incremental loads relative to a much larger base weight without losing resolution.
-- **Live** clears the base on all columns and reverts to showing the live value directly.
+**Zero/Cancel zero** — per-column, independent of Delta and the global average.
 
-### 5.2 Per-column Zero / Cancel zero
-
-Independent of Delta: pressing a column's **Zero** button blanks that column's two displays to `0`; **Cancel zero** resumes normal display. This does not affect the global average, the other columns, or the calibration offset.
-
-### 5.3 Per-column Calibrate
-
-Typing a number into **Calibration value** and pressing **Calibrate** stores it as `_cal_offset`, added directly to that column's displayed value only (`update_value`, basic_interface_ind570.py:329-347). It does not affect the underlying averaged kg in `SharedState`, only what that one column shows.
+**Calibrate** — per-column additive offset, display-only, doesn't touch the underlying average.
 
 ---
 
-## 6. Averaging and smoothing
+## Averaging
 
-- `SharedState` keeps a `collections.deque` capped at the configured window size (default 100, adjustable 1–1000 via the spinner).
-- Every parsed kg value from the IND570 stream is appended; the displayed result is the arithmetic mean of everything currently in the deque.
-- Changing the spinner value creates a **new, empty** deque at the new size (`set_avg_window`) — the average resets and starts refilling immediately, it does not resample the old buffer.
+Rolling average over a `deque`, window size 1–1000 (spinner, default 100). Changing the window resets the buffer — starts fresh, doesn't resample old data.
 
 ---
 
-## 7. Error / connection states
+## Connection states
 
-`_update_ui()` checks `SharedState.valid`:
-
-| `valid` | Meaning | UI behavior |
+| `valid` | Meaning | UI |
 |---|---|---|
-| `0` | No data yet | Status bar unchanged from initial text |
-| `1` | Receiving data normally | Status bar shows byte count in black; channel displays update |
-| `-1` | Socket exception (connect/read failed) | Status bar shows `ERROR: Cannot connect to <host>:<port>` in red; channel displays stop updating (last value stays on screen) |
+| 0 | no data yet | unchanged |
+| 1 | receiving | byte count shown, displays update |
+| -1 | socket error | red "ERROR: Cannot connect to host:port", last value frozen on screen |
 
-The reader thread retries the connection every 2 seconds indefinitely while `_running` is set — no manual reconnect action is needed if the IND570 or network comes back.
-
----
-
-## 8. Build / packaging
-
-- **Entry point:** `basic_interface_ind570.py`
-- **Dependency:** `PyQt5` (see `requirements.txt`)
-- **Packaging:** `StrainGauge.spec` (PyInstaller) bundles `adj_logo_small.png` and `adj_logo.jpeg` alongside the executable, named `StrainGauge`, windowed (no console)
-- **CI:** `.github/workflows/build-windows.yml` builds `StrainGauge.exe` on `windows-latest` on every push to `main` and on version tags (`v*`), uploading it as a workflow artifact and attaching it to the GitHub Release for tagged builds
+Auto-retries every 2s. No manual reconnect needed.
 
 ---
 
-## 9. Known gaps between UI and behavior (for future cleanup)
+## Build
 
-These are not bugs preventing operation, but UI elements that currently do nothing or less than they visually imply — worth knowing so they aren't mistaken for configuration options:
+- Entry point: `basic_interface_ind570.py`
+- Dep: PyQt5 (`requirements.txt`)
+- Package: `StrainGauge.spec` (PyInstaller), bundles the logo images, windowed exe, name `StrainGauge`
+- CI: `.github/workflows/build-windows.yml` builds on `windows-latest`, push to `main` or `v*` tags, uploads exe as artifact / release asset
 
-- COM-port dropdown, **Update port list**, **Save port name** — not wired to the connection (see §4.1)
-- **Save coefficients** button (top-right) — not wired to anything
-- Top 7-segment display per column, **temp =** field, both **k =** fields — not driven by any live calculation
-- **Tons** / **2 × Tons** modes — do not apply a kg→ton scale factor, only relabel the unit
+---
 
-If any of these are meant to become functional (e.g., configurable IND570 host/port from the dropdown, real per-arm coefficients, true ton conversion), that's a scoped follow-up — flag which ones matter and it can be planned separately.
+## Known unwired stuff
+
+Not bugs, just UI that doesn't do what it looks like it does:
+
+- COM dropdown, "Update port list", "Save port name" — no-ops
+- "Save coefficients" — no-op
+- Top 7-seg display, `temp =`, both `k =` fields — not live
+- Tons/2×Tons — don't actually scale by 1000
+
+If any of these need to become real, that's separate work — say which ones matter.
