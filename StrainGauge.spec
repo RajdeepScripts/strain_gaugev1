@@ -5,7 +5,7 @@ a = Analysis(
     ['basic_interface_ind570.py'],
     pathex=[],
     binaries=[],
-    datas=[('adj_logo_small.png', '.'), ('adj_logo.jpeg', '.')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

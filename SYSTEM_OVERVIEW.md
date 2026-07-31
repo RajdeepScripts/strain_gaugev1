@@ -122,7 +122,7 @@ Auto-retries every 2s. No manual reconnect needed.
 
 - Entry point: `basic_interface_ind570.py`
 - Dep: PyQt5 (`requirements.txt`)
-- Package: `StrainGauge.spec` (PyInstaller), bundles the logo images, windowed exe, name `StrainGauge`
+- Package: `StrainGauge.spec` (PyInstaller), windowed exe, name `StrainGauge`
 - CI: `.github/workflows/build-windows.yml` builds on `windows-latest`, push to `main` or `v*` tags, uploads exe as artifact / release asset
 
 ---
