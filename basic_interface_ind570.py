@@ -19,10 +19,29 @@ from PyQt5.QtWidgets import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# SOFTWARE_ID: increment whenever a change could affect metrological function
+# or accuracy (calculations, parsing, averaging, calibration/zero handling).
+# Purely cosmetic UI changes do not require a bump.
+SOFTWARE_ID = "1.0.0"
+
 IND570_HOST = "192.168.0.1"
 IND570_PORT = 1702
 AVG_MAX     = 1000
 KG_TO_KN    = 0.00981
+
+# ── Metrological constants (OIML R 106-1 §3.2.7) ────────────────────────────
+# Scale interval, d, and maximum capacity, Max, as configured on the IND570.
+SCALE_INTERVAL_KG = 0.01    # d  = 10 g
+MAX_CAPACITY_KG   = 150.0   # Max = 150 kg
+
+ZERO_ACCURACY_KG       = 0.25 * SCALE_INTERVAL_KG   # §3.2.7.1: ±0.25 d
+ZERO_RANGE_KG           = 0.04 * MAX_CAPACITY_KG      # §3.2.7.2: 4% of Max
+INITIAL_ZERO_RANGE_KG   = 0.20 * MAX_CAPACITY_KG      # §3.2.7.2: 20% of Max (initial)
+
+# §3.3.5.3 "stable equilibrium": indication must not deviate by more than
+# 1 scale interval across the samples checked before zero-setting is allowed.
+STABILITY_WINDOW_SAMPLES = 5
+STABILITY_BAND_KG        = 1.0 * SCALE_INTERVAL_KG
 
 _LINE_RE = re.compile(r'([+-]?\d+\.?\d*)\s*(kg|g|lb|t)', re.IGNORECASE)
 
@@ -236,10 +255,13 @@ class SegmentDisplay(QWidget):
 class ChannelColumn(QWidget):
     def __init__(self, ch_num, parent=None):
         super().__init__(parent)
-        self._cal_offset = 0.0
-        self._zeroed     = False
-        self._base_val   = None
-        self._last_val   = 0.0
+        self._cal_offset  = 0.0
+        self._base_val    = None
+        self._last_val    = 0.0
+        self._zero_offset = 0.0
+        self._zero_set    = False
+        self._first_zero  = True   # first zero-set uses the wider "initial" range
+        self._recent_kg   = deque(maxlen=STABILITY_WINDOW_SAMPLES)
         self._build(ch_num)
 
     def _build(self, ch_num):
@@ -292,6 +314,12 @@ class ChannelColumn(QWidget):
         self._cal_edit = QLineEdit("0")
         col.addWidget(self._cal_edit)
 
+        # Zero-setting status (§3.2.7 accept/reject feedback)
+        self._zero_status = QLabel("")
+        self._zero_status.setStyleSheet("color: #a00; font-size: 10px;")
+        self._zero_status.setWordWrap(True)
+        col.addWidget(self._zero_status)
+
         # Buttons — full width, stacked
         btn_cal    = QPushButton("Calibrate")
         btn_zero   = QPushButton("Zero")
@@ -311,12 +339,45 @@ class ChannelColumn(QWidget):
         except ValueError:
             self._cal_offset = 0.0
 
+    def _is_stable(self):
+        # §3.3.5.3 stable equilibrium: indication must not vary by more than
+        # 1 scale interval across the recent sample window.
+        if len(self._recent_kg) < STABILITY_WINDOW_SAMPLES:
+            return False
+        return (max(self._recent_kg) - min(self._recent_kg)) <= STABILITY_BAND_KG
+
     def _on_zero(self):
-        self._zeroed   = True
-        self._base_val = None
+        # §3.2.7.3(a): semi-automatic zero-setting shall function only when
+        # the instrument is in stable equilibrium.
+        if not self._is_stable():
+            self._zero_status.setText("Zero rejected: reading not stable")
+            return
+
+        candidate = self._recent_kg[-1] if self._recent_kg else 0.0
+        allowed_range = INITIAL_ZERO_RANGE_KG if self._first_zero else ZERO_RANGE_KG
+
+        # §3.2.7.2: zero-setting range capped at 4% of Max (20% for the
+        # initial zero-setting).
+        if abs(candidate) > allowed_range:
+            self._zero_status.setText(
+                f"Zero rejected: {candidate:+.3f} kg exceeds "
+                f"±{allowed_range:.2f} kg zero-setting range"
+            )
+            return
+
+        self._zero_offset = candidate
+        self._zero_set    = True
+        self._first_zero  = False
+        self._base_val    = None
+        self._zero_status.setText(
+            f"Zeroed (offset {self._zero_offset:+.3f} kg, "
+            f"accuracy target ±{ZERO_ACCURACY_KG:.3f} kg)"
+        )
 
     def _on_cancel_zero(self):
-        self._zeroed = False
+        self._zero_offset = 0.0
+        self._zero_set    = False
+        self._zero_status.setText("")
 
     def set_delta(self, val: float, raw_kg: float):
         self._base_val = val
@@ -326,23 +387,28 @@ class ChannelColumn(QWidget):
         self._base_val = None
         self._base_kg  = None
 
-    def update_value(self, val: float, unit: str, raw_kg: float):
+    def update_value(self, val: float, unit: str, raw_kg: float,
+                      mode: str = None, apply_mode_fn=None):
         self._last_val = val
+        self._recent_kg.append(raw_kg)
 
         self._unit_label.setText(unit)
-
-        if self._zeroed:
-            self._top_display.setText(" 0")
-            self._kn_display.setText(" 0")
-            return
-
         self._top_display.setText("0")
+
+        # §3.2.7: zeroed value tracks real changes from the captured
+        # baseline, it does not freeze at 0. Re-derive through the same
+        # mode conversion used for val, so units stay consistent (e.g. Tons).
+        zeroed_raw_kg = raw_kg - self._zero_offset
+        if apply_mode_fn is not None and mode is not None:
+            zeroed_val, _ = apply_mode_fn(zeroed_raw_kg, mode)
+        else:
+            zeroed_val = val
 
         if self._base_val is not None:
             # delta in raw kg divided by 1000, added to mode-converted base
-            display_val = self._base_val + (raw_kg - self._base_kg) / 1000.0
+            display_val = self._base_val + (zeroed_raw_kg - self._base_kg) / 1000.0
         else:
-            display_val = val
+            display_val = zeroed_val
 
         self._kn_display.setText(f"{display_val + self._cal_offset:.3f}")
 
@@ -352,7 +418,7 @@ class ChannelColumn(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("4x4 Basic Interface")
+        self.setWindowTitle(f"4x4 Basic Interface — SW {SOFTWARE_ID}")
         self.showMaximized()
 
         self._state   = SharedState(avg_win=100)
@@ -509,9 +575,9 @@ class MainWindow(QMainWindow):
         elif mode == "2 × kg":
             return kg * 2, "kg"
         elif mode == "Tons":
-            return kg, "T"
+            return kg * 1000.0, "T"
         else:
-            return kg * 2, "T"
+            return (kg * 1000.0) * 2, "T"
 
     def _on_delta(self):
         d = self._state.snapshot()
@@ -557,7 +623,7 @@ class MainWindow(QMainWindow):
             mode = self._mode_combo.currentText()
             val, unit = self._apply_mode(kg, mode)
             for ch in self._channels:
-                ch.update_value(val, unit, kg)
+                ch.update_value(val, unit, kg, mode, self._apply_mode)
 
     def closeEvent(self, event):
         self._running.clear()
