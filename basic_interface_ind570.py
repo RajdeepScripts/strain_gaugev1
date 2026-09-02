@@ -13,9 +13,9 @@ from collections import deque
 from PyQt5.QtCore import Qt, QTimer, QRect
 from PyQt5.QtGui import QFont, QPainter, QColor, QPen
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QDoubleSpinBox, QFrame, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -42,6 +42,12 @@ INITIAL_ZERO_RANGE_KG   = 0.20 * MAX_CAPACITY_KG      # §3.2.7.2: 20% of Max (i
 # 1 scale interval across the samples checked before zero-setting is allowed.
 STABILITY_WINDOW_SAMPLES = 5
 STABILITY_BAND_KG        = 1.0 * SCALE_INTERVAL_KG
+
+# Default per-channel calibration offset (kg), applied automatically on
+# startup so it doesn't need to be re-entered every session. Derived from
+# comparing a known reference weight against the IND570's raw TCP stream
+# (stream read +0.03 kg high). Update this if that discrepancy changes.
+DEFAULT_CAL_OFFSET_KG = -0.03
 
 _LINE_RE = re.compile(r'([+-]?\d+\.?\d*)\s*(kg|g|lb|t)', re.IGNORECASE)
 
@@ -81,7 +87,10 @@ class SharedState:
         with self._lock:
             self._buf.append(kg)
             avg = sum(self._buf) / len(self._buf)
-            self.result_kg = avg - self._tare_kg
+            # DEFAULT_CAL_OFFSET_KG is applied here so every consumer of
+            # result_kg (channel displays, the OIML error-test wizard, Delta)
+            # sees the same, already-calibrated value — not just the display.
+            self.result_kg = avg - self._tare_kg + DEFAULT_CAL_OFFSET_KG
             self.result_kn = self.result_kg * KG_TO_KN
             self.bytes_rx  = bytes_rx
             self.valid     = 1
@@ -255,6 +264,9 @@ class SegmentDisplay(QWidget):
 class ChannelColumn(QWidget):
     def __init__(self, ch_num, parent=None):
         super().__init__(parent)
+        # Global correction (DEFAULT_CAL_OFFSET_KG) is already applied in
+        # SharedState.push(), so this per-channel offset starts at 0 and is
+        # only for additional, channel-specific fine-tuning if ever needed.
         self._cal_offset  = 0.0
         self._base_val    = None
         self._last_val    = 0.0
@@ -380,6 +392,10 @@ class ChannelColumn(QWidget):
         self._zero_status.setText("")
 
     def set_delta(self, val: float, raw_kg: float):
+        # val is this channel's calibrated, zero-compensated, mode-scaled
+        # base (see MainWindow._on_delta); raw_kg is the uncalibrated raw
+        # kg reading at press-time, used by update_value() to recompute
+        # the same base on the fly as zero/calibration may change later.
         self._base_val = val
         self._base_kg  = raw_kg
 
@@ -395,22 +411,199 @@ class ChannelColumn(QWidget):
         self._unit_label.setText(unit)
         self._top_display.setText("0")
 
-        # §3.2.7: zeroed value tracks real changes from the captured
-        # baseline, it does not freeze at 0. Re-derive through the same
-        # mode conversion used for val, so units stay consistent (e.g. Tons).
-        zeroed_raw_kg = raw_kg - self._zero_offset
+        # Calibration is applied to the raw kg reading, before mode scaling,
+        # so a correction like -0.03 kg scales consistently across kg /
+        # 2×kg / Tons / 2×Tons instead of being a flat, mode-blind offset.
+        cal_raw_kg = raw_kg - self._zero_offset + self._cal_offset
+
         if apply_mode_fn is not None and mode is not None:
-            zeroed_val, _ = apply_mode_fn(zeroed_raw_kg, mode)
+            display_candidate, _ = apply_mode_fn(cal_raw_kg, mode)
         else:
-            zeroed_val = val
+            display_candidate = val
 
         if self._base_val is not None:
-            # delta in raw kg divided by 1000, added to mode-converted base
-            display_val = self._base_val + (zeroed_raw_kg - self._base_kg) / 1000.0
+            # Delta = current calibrated value minus the base calibrated
+            # value, both run through the same mode conversion, so units,
+            # scale, and calibration all match at press-time and after.
+            if apply_mode_fn is not None and mode is not None:
+                base_cal_raw_kg = self._base_kg - self._zero_offset + self._cal_offset
+                base_val_now, _ = apply_mode_fn(base_cal_raw_kg, mode)
+            else:
+                base_val_now = self._base_val
+            display_val = self._base_val + (display_candidate - base_val_now)
         else:
-            display_val = zeroed_val
+            display_val = display_candidate
 
-        self._kn_display.setText(f"{display_val + self._cal_offset:.3f}")
+        self._kn_display.setText(f"{display_val:.3f}")
+
+
+# ── OIML R 106-1 §A.3.5 error-prior-to-rounding wizard ────────────────────────
+#
+# Guides a single ΔL pass (either the zero-load pass for E0, or the loaded
+# pass for E), per §A.3.5.1:
+#   P = I + 0.5*d - ΔL
+#   E = P - L
+# The MainWindow ties two passes together and computes Ec = E - E0.
+
+class ErrorPassDialog(QDialog):
+    """One pass of the §A.3.5.1 procedure: capture I, watch for a 1-d tick,
+    ask for the total added weight (ΔL), then report P and E for this pass."""
+
+    def __init__(self, state: 'SharedState', reference_load_kg: float,
+                 pass_label: str, parent=None):
+        super().__init__(parent)
+        self._state = state
+        self._L     = reference_load_kg
+        self.result_E = None
+        self.result_P = None
+        self.result_I = None
+
+        self.setWindowTitle(f"§A.3.5.1 Error Test — {pass_label}")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            f"Reference load L = {self._L:.3f} t\n"
+            f"Scale interval d = {SCALE_INTERVAL_KG:.3f} kg\n\n"
+            f"Step 1: leave the load undisturbed and press \"Capture I\" to "
+            f"record the current indication.\nStep 2: add small test "
+            f"weights (~{0.1 * SCALE_INTERVAL_KG:.4f} kg each) until "
+            f"the indication increases by one full scale interval, then "
+            f"press \"Indication ticked up\"."
+        ))
+
+        self._i_label = QLabel("I = (not captured)")
+        layout.addWidget(self._i_label)
+
+        self._live_label = QLabel("Live: —")
+        layout.addWidget(self._live_label)
+
+        self._btn_capture = QPushButton("Capture I")
+        self._btn_capture.clicked.connect(self._on_capture_i)
+        layout.addWidget(self._btn_capture)
+
+        self._btn_ticked = QPushButton("Indication ticked up by 1 d")
+        self._btn_ticked.setEnabled(False)
+        self._btn_ticked.clicked.connect(self._on_ticked)
+        layout.addWidget(self._btn_ticked)
+
+        self._result_label = QLabel("")
+        self._result_label.setWordWrap(True)
+        layout.addWidget(self._result_label)
+
+        self._btn_close = QPushButton("Close")
+        self._btn_close.setEnabled(False)
+        self._btn_close.clicked.connect(self.accept)
+        layout.addWidget(self._btn_close)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh_live)
+        self._timer.start(200)
+
+    def _refresh_live(self):
+        d = self._state.snapshot()
+        if d['valid'] == 1:
+            self._live_label.setText(f"Live: {d['result_kg']:.3f} t")
+
+    def _on_capture_i(self):
+        d = self._state.snapshot()
+        if d['valid'] != 1:
+            QMessageBox.warning(self, "No data",
+                                 "No valid live reading yet — check the "
+                                 "IND570 connection and try again.")
+            return
+        self.result_I = d['result_kg']
+        self._i_label.setText(f"I = {self.result_I:.3f} t")
+        self._btn_capture.setEnabled(False)
+        self._btn_ticked.setEnabled(True)
+
+    def _on_ticked(self):
+        if self.result_I is None:
+            return
+        delta_l, ok = self._prompt_delta_l()
+        if not ok:
+            return
+
+        # §A.3.5.1: P = I + 0.5*d - ΔL ; E = P - L
+        self.result_P = self.result_I + 0.5 * SCALE_INTERVAL_KG - delta_l
+        self.result_E = self.result_P - self._L
+
+        self._result_label.setText(
+            f"ΔL = {delta_l:.4f} t\n"
+            f"P (indication prior to rounding) = {self.result_P:.4f} t\n"
+            f"E (error) = {self.result_E:.4f} t"
+        )
+        self._btn_ticked.setEnabled(False)
+        self._btn_close.setEnabled(True)
+
+    def _prompt_delta_l(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Total added weight (ΔL)")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "Enter the total weight added since \"Capture I\" that caused "
+            "the indication to tick up by one scale interval (kg):"
+        ))
+        spin = QDoubleSpinBox()
+        spin.setDecimals(4)
+        spin.setRange(0.0, MAX_CAPACITY_KG)
+        spin.setSingleStep(0.001)
+        v.addWidget(spin)
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(dlg.accept)
+        v.addWidget(btn_ok)
+        accepted = dlg.exec_() == QDialog.Accepted
+        return spin.value(), accepted
+
+
+class ErrorTestSummaryDialog(QDialog):
+    """Runs both passes (zero load, then test load) and reports Ec."""
+
+    def __init__(self, state: 'SharedState', parent=None):
+        super().__init__(parent)
+        self._state = state
+        self.setWindowTitle("OIML R 106-1 §A.3.5.1 — Error Prior to Rounding")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "This runs the §A.3.5.1 procedure at a reference load L you "
+            "choose (use L=0 for a zero-load check): E = P - L."
+        ))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Reference load L (kg):"))
+        self._l_spin = QDoubleSpinBox()
+        self._l_spin.setDecimals(3)
+        self._l_spin.setRange(0.0, MAX_CAPACITY_KG)
+        self._l_spin.setSingleStep(0.1)
+        row.addWidget(self._l_spin)
+        layout.addLayout(row)
+
+        self._btn_run = QPushButton("Run test")
+        self._btn_run.clicked.connect(self._run_test)
+        layout.addWidget(self._btn_run)
+
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        layout.addWidget(self._log)
+
+        self._btn_close = QPushButton("Close")
+        self._btn_close.clicked.connect(self.accept)
+        layout.addWidget(self._btn_close)
+
+    def _run_test(self):
+        # L is entered as a raw kg-scale number, same scale as I and ΔL —
+        # only the *displayed* text is multiplied by 1000 and labeled "t".
+        L = self._l_spin.value()
+        dlg = ErrorPassDialog(self._state, L, f"L={L:.3f} t", self)
+        dlg.exec_()
+        if dlg.result_E is not None:
+            self._log.append(
+                f"[L={L:.4f} t] I={dlg.result_I:.4f} t, "
+                f"P={dlg.result_P:.4f} t, E={dlg.result_E:.4f} t"
+            )
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -522,12 +715,12 @@ class MainWindow(QMainWindow):
         sep2.setFrameShape(QFrame.VLine)
         bar.addWidget(sep2)
 
-        btn_delta = QPushButton("Δ  Delta")
-        btn_live  = QPushButton("Live")
-        btn_delta.clicked.connect(self._on_delta)
-        btn_live.clicked.connect(self._on_live)
-        bar.addWidget(btn_delta)
-        bar.addWidget(btn_live)
+        self._btn_delta = QPushButton("Δ  Delta")
+        self._btn_live  = QPushButton("Live")
+        self._btn_delta.clicked.connect(self._on_delta)
+        self._btn_live.clicked.connect(self._on_live)
+        bar.addWidget(self._btn_delta)
+        bar.addWidget(self._btn_live)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.VLine)
@@ -543,6 +736,10 @@ class MainWindow(QMainWindow):
 
         self._status_label = QLabel("Last packages: —   Bytes on port: 0")
         bar.addWidget(self._status_label, stretch=1)
+
+        btn_error_test = QPushButton("OIML §A.3.5 Error Test")
+        btn_error_test.clicked.connect(self._on_open_error_test)
+        bar.addWidget(btn_error_test)
 
         btn_exit = QPushButton("Exit program")
         btn_exit.clicked.connect(self.close)
@@ -575,9 +772,9 @@ class MainWindow(QMainWindow):
         elif mode == "2 × kg":
             return kg * 2, "kg"
         elif mode == "Tons":
-            return kg * 1000.0, "T"
+            return kg, "T"
         else:
-            return (kg * 1000.0) * 2, "T"
+            return kg * 2, "T"
 
     def _on_delta(self):
         d = self._state.snapshot()
@@ -585,10 +782,21 @@ class MainWindow(QMainWindow):
             return
         kg   = d['result_kg']
         mode = self._mode_combo.currentText()
-        val, unit = self._apply_mode(kg, mode)
+        _, unit = self._apply_mode(kg, mode)
         for ch in self._channels:
-            ch.set_delta(val, kg)
-        self._base_label.setText(f"Base: {val:.3f} {unit}")
+            # Base is each channel's own calibrated, mode-scaled value —
+            # calibration applied to raw kg before mode scaling, matching
+            # update_value(), so it stays consistent across kg/2×kg/Tons/
+            # 2×Tons and doesn't drift when Delta is pressed.
+            base_cal_raw_kg = kg - ch._zero_offset + ch._cal_offset
+            base_val, _ = self._apply_mode(base_cal_raw_kg, mode)
+            ch.set_delta(base_val, kg)
+        # Show the base as it will actually be displayed, using Channel 1's
+        # calibration/zero — channels normally share the same settings.
+        ch0 = self._channels[0]
+        displayed_base_kg = kg - ch0._zero_offset + ch0._cal_offset
+        displayed_base, _ = self._apply_mode(displayed_base_kg, mode)
+        self._base_label.setText(f"Base: {displayed_base:.3f} {unit}")
 
     def _on_live(self):
         for ch in self._channels:
@@ -624,6 +832,10 @@ class MainWindow(QMainWindow):
             val, unit = self._apply_mode(kg, mode)
             for ch in self._channels:
                 ch.update_value(val, unit, kg, mode, self._apply_mode)
+
+    def _on_open_error_test(self):
+        dlg = ErrorTestSummaryDialog(self._state, self)
+        dlg.exec_()
 
     def closeEvent(self, event):
         self._running.clear()
