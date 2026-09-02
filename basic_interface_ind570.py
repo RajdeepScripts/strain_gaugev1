@@ -430,7 +430,7 @@ class ChannelColumn(QWidget):
                 base_val_now, _ = apply_mode_fn(base_cal_raw_kg, mode)
             else:
                 base_val_now = self._base_val
-            display_val = self._base_val + (display_candidate - base_val_now)
+            display_val = self._base_val + (display_candidate - base_val_now) / 1000.0
         else:
             display_val = display_candidate
 
