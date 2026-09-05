@@ -21,16 +21,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build executable
-        run: pyinstaller StrainGauge.spec
+      - name: Build executables
+        run: |
+          pyinstaller StrainGauge.spec
+          pyinstaller SingleChannel.spec
 
       - uses: actions/upload-artifact@v4
         with:
           name: StrainGauge-windows
           path: dist/StrainGauge.exe
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SingleChannel-windows
+          path: dist/SingleChannel.exe
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/StrainGauge.exe
+          files: |
+            dist/StrainGauge.exe
+            dist/SingleChannel.exe
