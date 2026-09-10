@@ -3,3 +3,4 @@ build/
 __pycache__/
 *.exe
 *.pyc
+ind570_config.json
