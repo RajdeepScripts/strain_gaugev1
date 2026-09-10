@@ -4,6 +4,8 @@ basic_interface_ind570.py — 4x4 Basic Interface (IND570 over TCP)
 4-channel weight display. Data from Mettler-Toledo IND570.
 """
 
+import datetime
+import os
 import re
 import socket
 import sys
@@ -29,6 +31,84 @@ IND570_PORT = 1702
 AVG_MAX     = 1000
 KG_TO_KN    = 0.00981
 
+# Connection-target persistence: "Save port name" writes the chosen host:port
+# here, and it's loaded at startup to override IND570_HOST/IND570_PORT above.
+# Purely a convenience so the target survives a restart — not metrologically
+# relevant (it doesn't affect parsing/averaging/calibration, only which
+# socket the reader thread connects to).
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ind570_config.json")
+
+
+def load_saved_target():
+    """Return (host, port) from CONFIG_PATH if present/valid, else None."""
+    try:
+        import json
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        host = str(data.get('host', '')).strip()
+        port = int(data.get('port'))
+        if host and 1 <= port <= 65535:
+            return host, port
+    except Exception:
+        pass
+    return None
+
+
+def save_target(host, port):
+    """Persist (host, port) to CONFIG_PATH. Returns True on success."""
+    try:
+        import json
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump({'host': host, 'port': port}, f)
+        return True
+    except OSError:
+        return False
+
+
+def parse_host_port(text, default_port=None):
+    """Parse 'host:port' or bare 'host' -> (host, port). Returns None if invalid."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    if ':' in text:
+        host, _, port_str = text.rpartition(':')
+        host = host.strip()
+        try:
+            port = int(port_str.strip())
+        except ValueError:
+            return None
+    else:
+        host = text
+        port = default_port
+    if not host or port is None or not (1 <= port <= 65535):
+        return None
+    return host, port
+
+
+_saved = load_saved_target()
+if _saved is not None:
+    IND570_HOST, IND570_PORT = _saved
+
+# Raw-stream debug logging: off by default (this is a diagnostic aid, not a
+# metrologically relevant feature). Enable via env var when you need to see
+# exactly what bytes the IND570 is sending, e.g.:
+#   RAW_STREAM_LOG=raw_stream.log python3 basic_interface_ind570.py
+RAW_STREAM_LOG = os.environ.get("RAW_STREAM_LOG", "").strip()
+
+
+def _log_raw_chunk(chunk_bytes):
+    """Append one raw TCP chunk to RAW_STREAM_LOG, hex + printable ASCII."""
+    if not RAW_STREAM_LOG:
+        return
+    ts = datetime.datetime.now().isoformat(timespec='milliseconds')
+    hex_str = chunk_bytes.hex(' ')
+    ascii_str = chunk_bytes.decode('ascii', errors='replace')
+    try:
+        with open(RAW_STREAM_LOG, 'a', encoding='utf-8') as f:
+            f.write(f"[{ts}] {len(chunk_bytes)}B\n  hex:   {hex_str}\n  ascii: {ascii_str!r}\n")
+    except OSError:
+        pass
+
 # ── Metrological constants (OIML R 106-1 §3.2.7) ────────────────────────────
 # Scale interval, d, and maximum capacity, Max, as configured on the IND570.
 SCALE_INTERVAL_KG = 0.01    # d  = 10 g
@@ -42,12 +122,6 @@ INITIAL_ZERO_RANGE_KG   = 0.20 * MAX_CAPACITY_KG      # §3.2.7.2: 20% of Max (i
 # 1 scale interval across the samples checked before zero-setting is allowed.
 STABILITY_WINDOW_SAMPLES = 5
 STABILITY_BAND_KG        = 1.0 * SCALE_INTERVAL_KG
-
-# Default per-channel calibration offset (kg), applied automatically on
-# startup so it doesn't need to be re-entered every session. Derived from
-# comparing a known reference weight against the IND570's raw TCP stream
-# (stream read +0.03 kg high). Update this if that discrepancy changes.
-DEFAULT_CAL_OFFSET_KG = -0.03
 
 _LINE_RE = re.compile(r'([+-]?\d+\.?\d*)\s*(kg|g|lb|t)', re.IGNORECASE)
 
@@ -87,10 +161,7 @@ class SharedState:
         with self._lock:
             self._buf.append(kg)
             avg = sum(self._buf) / len(self._buf)
-            # DEFAULT_CAL_OFFSET_KG is applied here so every consumer of
-            # result_kg (channel displays, the OIML error-test wizard, Delta)
-            # sees the same, already-calibrated value — not just the display.
-            self.result_kg = avg - self._tare_kg + DEFAULT_CAL_OFFSET_KG
+            self.result_kg = avg - self._tare_kg
             self.result_kn = self.result_kg * KG_TO_KN
             self.bytes_rx  = bytes_rx
             self.valid     = 1
@@ -111,18 +182,22 @@ class SharedState:
 
 # ── TCP reader thread ─────────────────────────────────────────────────────────
 
-def reader_thread(state, running):
+def reader_thread(state, running, host=None, port=None):
+    host = host or IND570_HOST
+    port = port or IND570_PORT
     while running.is_set():
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(3)
-            sock.connect((IND570_HOST, IND570_PORT))
+            sock.connect((host, port))
             buf      = ''
             bytes_rx = 0
             while running.is_set():
-                chunk = sock.recv(256).decode('ascii', errors='ignore')
-                if not chunk:
+                raw_chunk = sock.recv(256)
+                if not raw_chunk:
                     break
+                _log_raw_chunk(raw_chunk)
+                chunk = raw_chunk.decode('ascii', errors='ignore')
                 bytes_rx += len(chunk)
                 buf += chunk
                 while '\n' in buf:
@@ -139,6 +214,44 @@ def reader_thread(state, running):
                 pass
         if running.is_set():
             threading.Event().wait(2)
+
+
+# ── Port discovery ────────────────────────────────────────────────────────────
+# Same technique as find_ind570.py: short TCP connect-probes across the local
+# /24, used by the "Update port list" button. Read-only against the network
+# (no writes to the IND570), so safe to run while the app is live.
+
+def scan_for_targets(port, subnet_base=None, timeout=0.3, max_workers=64):
+    """Return a list of 'host:port' strings that accepted a TCP connection
+    on `port`. subnet_base defaults to this machine's own /24 (derived from
+    IND570_HOST) if not given."""
+    import ipaddress
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    base = subnet_base or IND570_HOST
+    try:
+        network = ipaddress.ip_network(f"{base}/24", strict=False)
+    except ValueError:
+        return []
+
+    def probe(ip):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((str(ip), port))
+                return str(ip)
+        except OSError:
+            return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(probe, ip) for ip in network.hosts()]
+        for fut in as_completed(futures):
+            ip = fut.result()
+            if ip:
+                found.append(ip)
+    found.sort(key=lambda ip: tuple(int(p) for p in ip.split('.')))
+    return [f"{ip}:{port}" for ip in found]
 
 
 # ── 7-Segment display widget ──────────────────────────────────────────────────
@@ -262,11 +375,8 @@ class SegmentDisplay(QWidget):
 # ── Channel column ────────────────────────────────────────────────────────────
 
 class ChannelColumn(QWidget):
-    def __init__(self, ch_num, parent=None):
+    def __init__(self, ch_num, parent=None, show_buttons=True):
         super().__init__(parent)
-        # Global correction (DEFAULT_CAL_OFFSET_KG) is already applied in
-        # SharedState.push(), so this per-channel offset starts at 0 and is
-        # only for additional, channel-specific fine-tuning if ever needed.
         self._cal_offset  = 0.0
         self._base_val    = None
         self._last_val    = 0.0
@@ -274,9 +384,9 @@ class ChannelColumn(QWidget):
         self._zero_set    = False
         self._first_zero  = True   # first zero-set uses the wider "initial" range
         self._recent_kg   = deque(maxlen=STABILITY_WINDOW_SAMPLES)
-        self._build(ch_num)
+        self._build(ch_num, show_buttons)
 
-    def _build(self, ch_num):
+    def _build(self, ch_num, show_buttons=True):
         col = QVBoxLayout(self)
         col.setSpacing(4)
         col.setContentsMargins(4, 4, 4, 4)
@@ -321,27 +431,33 @@ class ChannelColumn(QWidget):
         kn_row.addWidget(self._unit_label)
         col.addLayout(kn_row)
 
-        # Calibration value label + input
-        col.addWidget(QLabel("Calibration value:"))
-        self._cal_edit = QLineEdit("0")
-        col.addWidget(self._cal_edit)
-
-        # Zero-setting status (§3.2.7 accept/reject feedback)
+        # Calibration value label + input, Zero status, and the Calibrate/
+        # Zero/Cancel-zero buttons — only for channels that actually offer
+        # calibration/zero control (channel 1 in the single-live-channel +
+        # Total weight layout; all channels otherwise).
         self._zero_status = QLabel("")
-        self._zero_status.setStyleSheet("color: #a00; font-size: 10px;")
-        self._zero_status.setWordWrap(True)
-        col.addWidget(self._zero_status)
+        if show_buttons:
+            col.addWidget(QLabel("Calibration value:"))
+            self._cal_edit = QLineEdit("0")
+            col.addWidget(self._cal_edit)
 
-        # Buttons — full width, stacked
-        btn_cal    = QPushButton("Calibrate")
-        btn_zero   = QPushButton("Zero")
-        btn_cancel = QPushButton("Cancel zero")
-        btn_cal.clicked.connect(self._on_calibrate)
-        btn_zero.clicked.connect(self._on_zero)
-        btn_cancel.clicked.connect(self._on_cancel_zero)
-        col.addWidget(btn_cal)
-        col.addWidget(btn_zero)
-        col.addWidget(btn_cancel)
+            # Zero-setting status (§3.2.7 accept/reject feedback)
+            self._zero_status.setStyleSheet("color: #a00; font-size: 10px;")
+            self._zero_status.setWordWrap(True)
+            col.addWidget(self._zero_status)
+
+            # Buttons — full width, stacked
+            btn_cal    = QPushButton("Calibrate")
+            btn_zero   = QPushButton("Zero")
+            btn_cancel = QPushButton("Cancel zero")
+            btn_cal.clicked.connect(self._on_calibrate)
+            btn_zero.clicked.connect(self._on_zero)
+            btn_cancel.clicked.connect(self._on_cancel_zero)
+            col.addWidget(btn_cal)
+            col.addWidget(btn_zero)
+            col.addWidget(btn_cancel)
+        else:
+            self._cal_edit = QLineEdit("0")  # kept off-screen for API parity
 
         col.addStretch()
 
@@ -434,7 +550,43 @@ class ChannelColumn(QWidget):
         else:
             display_val = display_candidate
 
-        self._kn_display.setText(f"{display_val:.3f}")
+        is_tons = mode in ("Tons", "2 × Tons")
+        self._kn_display.setText(f"{display_val:.0f}" if is_tons else f"{display_val:.3f}")
+        return display_val
+
+
+# ── Total weight panel ────────────────────────────────────────────────────────
+# Bottom-right panel mirroring channel 1's value — replaces channels 2-4's
+# Calibrate/Zero/Cancel-zero buttons with one larger Total weight readout.
+
+class TotalWeightPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        col = QVBoxLayout(self)
+        col.setSpacing(4)
+        col.setContentsMargins(4, 4, 4, 4)
+
+        title = QLabel("Total weight")
+        title.setFont(QFont("Arial", 9, QFont.Bold))
+        col.addWidget(title)
+
+        row = QHBoxLayout()
+        self._display = SegmentDisplay(height=100)
+        self._display.setFixedWidth(400)
+        row.addWidget(self._display)
+        self._unit_label = QLabel("kg")
+        self._unit_label.setFont(QFont("Arial", 9))
+        self._unit_label.setFixedWidth(30)
+        row.addWidget(self._unit_label)
+        row.addStretch()
+        col.addLayout(row)
+
+        col.addStretch()
+
+    def update_value(self, display_val: float, unit: str, mode: str = None):
+        self._unit_label.setText(unit)
+        is_tons = mode in ("Tons", "2 × Tons")
+        self._display.setText(f"{display_val:.0f}" if is_tons else f"{display_val:.3f}")
 
 
 # ── OIML R 106-1 §A.3.5 error-prior-to-rounding wizard ────────────────────────
@@ -617,6 +769,8 @@ class MainWindow(QMainWindow):
         self._state   = SharedState(avg_win=100)
         self._running = threading.Event()
         self._running.set()
+        self._active_host = IND570_HOST
+        self._active_port = IND570_PORT
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -649,14 +803,20 @@ class MainWindow(QMainWindow):
         self._btn_stop.clicked.connect(self._on_stop)
 
         self._com_combo = QComboBox()
+        self._com_combo.setEditable(True)
         self._com_combo.addItems(["COM7", f"{IND570_HOST}:{IND570_PORT}"])
         self._com_combo.setCurrentIndex(1)
+
+        self._btn_update_ports = QPushButton("Update port list")
+        self._btn_save_port    = QPushButton("Save port name")
+        self._btn_update_ports.clicked.connect(self._on_update_port_list)
+        self._btn_save_port.clicked.connect(self._on_save_port_name)
 
         bar.addWidget(self._btn_start)
         bar.addWidget(self._btn_stop)
         bar.addWidget(self._com_combo)
-        bar.addWidget(QPushButton("Update port list"))
-        bar.addWidget(QPushButton("Save port name"))
+        bar.addWidget(self._btn_update_ports)
+        bar.addWidget(self._btn_save_port)
         bar.addStretch()
 
         outer = QHBoxLayout()
@@ -673,18 +833,43 @@ class MainWindow(QMainWindow):
     # ── 4 channel columns side by side ───────────────────────────────────────
 
     def _build_channels(self, root):
+        # Only channel 1 shows a live reading and keeps its Calibrate/Zero/
+        # Cancel-zero buttons. Channels 2-4 stay at 0 with those buttons
+        # removed, which leaves empty space at the bottom of their columns.
+        # The Total weight panel lives in that freed space, spanning
+        # channels 2-4's width as its own independent row — not nested
+        # inside any one channel's column/layout.
         self._channels = []
         row = QHBoxLayout()
         row.setSpacing(4)
-        for i in range(4):
-            ch = ChannelColumn(i + 1)
+
+        ch1 = ChannelColumn(1, show_buttons=True)
+        self._channels.append(ch1)
+        row.addWidget(ch1, stretch=1)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        row.addWidget(sep)
+
+        rest_col = QVBoxLayout()
+        rest_col.setSpacing(4)
+
+        rest_row = QHBoxLayout()
+        rest_row.setSpacing(4)
+        for i in (2, 3, 4):
+            ch = ChannelColumn(i, show_buttons=False)
             self._channels.append(ch)
-            row.addWidget(ch)
-            if i < 3:
-                sep = QFrame()
-                sep.setFrameShape(QFrame.VLine)
-                sep.setFrameShadow(QFrame.Sunken)
-                row.addWidget(sep)
+            rest_row.addWidget(ch)
+        rest_col.addLayout(rest_row)
+
+        self._total_panel = TotalWeightPanel()
+        rest_col.addWidget(self._total_panel)
+        rest_col.addStretch()
+
+        row.addLayout(rest_col, stretch=3)
+        # Channel 1 (stretch=1) matches the width of each of channels 2-4
+        # (stretch=3 split three ways = 1 each) — all 4 columns equal.
         root.addLayout(row, stretch=1)
 
     # ── Bottom bar ────────────────────────────────────────────────────────────
@@ -762,9 +947,8 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(False)
 
     def _on_mode_changed(self, mode: str):
-        unit = "T" if "Tons" in mode else "kg"
-        for ch in self._channels:
-            ch._unit_label.setText(unit)
+        self._channels[0]._unit_label.setText("kg")
+        self._total_panel._unit_label.setText("kg")
 
     def _apply_mode(self, kg: float, mode: str):
         if mode == "kg":
@@ -772,9 +956,9 @@ class MainWindow(QMainWindow):
         elif mode == "2 × kg":
             return kg * 2, "kg"
         elif mode == "Tons":
-            return kg, "T"
+            return kg * 1000, "kg"
         else:
-            return kg * 2, "T"
+            return kg * 2000, "kg"
 
     def _on_delta(self):
         d = self._state.snapshot()
@@ -783,32 +967,84 @@ class MainWindow(QMainWindow):
         kg   = d['result_kg']
         mode = self._mode_combo.currentText()
         _, unit = self._apply_mode(kg, mode)
-        for ch in self._channels:
-            # Base is each channel's own calibrated, mode-scaled value —
-            # calibration applied to raw kg before mode scaling, matching
-            # update_value(), so it stays consistent across kg/2×kg/Tons/
-            # 2×Tons and doesn't drift when Delta is pressed.
-            base_cal_raw_kg = kg - ch._zero_offset + ch._cal_offset
-            base_val, _ = self._apply_mode(base_cal_raw_kg, mode)
-            ch.set_delta(base_val, kg)
-        # Show the base as it will actually be displayed, using Channel 1's
-        # calibration/zero — channels normally share the same settings.
+        # Only channel 1 carries a live reading now — channels 2-4 stay at 0
+        # and don't participate in Delta.
         ch0 = self._channels[0]
-        displayed_base_kg = kg - ch0._zero_offset + ch0._cal_offset
-        displayed_base, _ = self._apply_mode(displayed_base_kg, mode)
-        self._base_label.setText(f"Base: {displayed_base:.3f} {unit}")
+        base_cal_raw_kg = kg - ch0._zero_offset + ch0._cal_offset
+        base_val, _ = self._apply_mode(base_cal_raw_kg, mode)
+        ch0.set_delta(base_val, kg)
+        self._base_label.setText(f"Base: {base_val:.3f} {unit}")
 
     def _on_live(self):
-        for ch in self._channels:
-            ch.clear_delta()
+        self._channels[0].clear_delta()
         self._base_label.setText("")
 
     def _start_reader(self):
         threading.Thread(
             target=reader_thread,
-            args=(self._state, self._running),
+            args=(self._state, self._running, self._active_host, self._active_port),
             daemon=True
         ).start()
+
+    def _reconnect_to(self, host, port):
+        """Stop the current reader (if any) and start a new one against
+        host:port. Used when the user picks/saves a different target."""
+        self._active_host = host
+        self._active_port = port
+        self._running.clear()
+        # Give the old reader loop a moment to notice running is clear and
+        # close its socket before we spin up a fresh one on the same state.
+        threading.Event().wait(0.1)
+        self._running.set()
+        self._start_reader()
+        self._btn_start.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+
+    def _on_update_port_list(self):
+        self._btn_update_ports.setEnabled(False)
+        self._btn_update_ports.setText("Scanning…")
+
+        def do_scan():
+            results = scan_for_targets(self._active_port, subnet_base=self._active_host)
+            QTimer.singleShot(0, lambda: self._on_scan_done(results))
+
+        threading.Thread(target=do_scan, daemon=True).start()
+
+    def _on_scan_done(self, results):
+        self._btn_update_ports.setEnabled(True)
+        self._btn_update_ports.setText("Update port list")
+        current = self._com_combo.currentText()
+        self._com_combo.clear()
+        self._com_combo.addItem("COM7")
+        for entry in results:
+            self._com_combo.addItem(entry)
+        idx = self._com_combo.findText(current)
+        self._com_combo.setCurrentIndex(idx if idx >= 0 else self._com_combo.count() - 1)
+        if not results:
+            QMessageBox.information(
+                self, "Update port list",
+                f"No device answered on port {self._active_port} in "
+                f"{self._active_host}'s /24 subnet."
+            )
+
+    def _on_save_port_name(self):
+        parsed = parse_host_port(self._com_combo.currentText(), default_port=self._active_port)
+        if parsed is None:
+            QMessageBox.warning(
+                self, "Save port name",
+                "Enter a valid target as host:port (e.g. 192.168.0.1:1702)."
+            )
+            return
+        host, port = parsed
+        if not save_target(host, port):
+            QMessageBox.warning(self, "Save port name", "Could not write config file.")
+            return
+        self._reconnect_to(host, port)
+        QMessageBox.information(
+            self, "Save port name",
+            f"Saved {host}:{port} as the connection target. Reconnecting now; "
+            f"this will also be used on the next launch."
+        )
 
     # ── UI update 100ms ───────────────────────────────────────────────────────
 
@@ -817,7 +1053,7 @@ class MainWindow(QMainWindow):
 
         if d['valid'] == -1:
             self._status_label.setText(
-                f"ERROR: Cannot connect to {IND570_HOST}:{IND570_PORT}"
+                f"ERROR: Cannot connect to {self._active_host}:{self._active_port}"
             )
             self._status_label.setStyleSheet("color: red;")
             return
@@ -830,8 +1066,9 @@ class MainWindow(QMainWindow):
             kg   = d['result_kg']
             mode = self._mode_combo.currentText()
             val, unit = self._apply_mode(kg, mode)
-            for ch in self._channels:
-                ch.update_value(val, unit, kg, mode, self._apply_mode)
+            # Only channel 1 shows the live reading; channels 2-4 stay at 0.
+            display_val = self._channels[0].update_value(val, unit, kg, mode, self._apply_mode)
+            self._total_panel.update_value(display_val, unit, mode)
 
     def _on_open_error_test(self):
         dlg = ErrorTestSummaryDialog(self._state, self)
